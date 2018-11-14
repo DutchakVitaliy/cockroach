@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package kv
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -27,34 +26,18 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
-	"golang.org/x/net/context"
+	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
 )
-
-// correctnessTestRetryOptions uses aggressive retries with a limit on
-// number of attempts so we don't get stuck behind indefinite
-// backoff/retry loops. If MaxAttempts is reached, transaction will
-// return retry error.
-//
-// Note that these options are used twice, at the stores via
-// setCorrectnessRetryOptions, and when constructing the client.
-var correctnessTestRetryOptions = retry.Options{
-	InitialBackoff: 1 * time.Millisecond,
-	MaxBackoff:     10 * time.Millisecond,
-	Multiplier:     10,
-	MaxRetries:     2,
-}
 
 type retryError struct {
 	txnIdx, cmdIdx int
@@ -76,17 +59,16 @@ func (re *retryError) Error() string {
 // enforce an ordering. If a previous wait channel is set, the
 // command waits on it before execution.
 type cmd struct {
-	name        string // name of the cmd for debug output
-	key, endKey string // key and optional endKey
-	debug       string // optional debug string
-	txnIdx      int    // transaction index in the history
-	historyIdx  int    // this suffixes key so tests get unique keys
-	expRetry    bool   // true if we expect a retry
-	fn          func(
-		c *cmd, txn *client.Txn, t *testing.T) error // execution function
-	ch   chan error       // channel for other commands to wait
-	prev *cmd             // this command must wait on previous command before executing
-	env  map[string]int64 // contains all previously read values
+	name        string                                                   // name of the cmd for debug output
+	key, endKey string                                                   // key and optional endKey
+	debug       string                                                   // optional debug string
+	txnIdx      int                                                      // transaction index in the history
+	historyIdx  int                                                      // this suffixes key so tests get unique keys
+	expRetry    bool                                                     // true if we expect a retry
+	fn          func(ctx context.Context, c *cmd, txn *client.Txn) error // execution function
+	ch          chan error                                               // channel for other commands to wait
+	prev        *cmd                                                     // this command must wait on previous command before executing
+	env         map[string]int64                                         // contains all previously read values
 }
 
 func (c *cmd) init(prev *cmd) {
@@ -118,7 +100,7 @@ func (c *cmd) execute(txn *client.Txn, t *testing.T) (string, error) {
 	if log.V(2) {
 		log.Infof(context.Background(), "executing %s", c)
 	}
-	err := c.fn(c, txn, t)
+	err := c.fn(context.Background(), c, txn)
 	if err == nil {
 		c.ch <- nil
 	}
@@ -165,8 +147,8 @@ func (c *cmd) String() string {
 }
 
 // readCmd reads a value from the db and stores it in the env.
-func readCmd(c *cmd, txn *client.Txn, t *testing.T) error {
-	r, err := txn.Get(c.getKey())
+func readCmd(ctx context.Context, c *cmd, txn *client.Txn) error {
+	r, err := txn.Get(ctx, c.getKey())
 	if err != nil {
 		return err
 	}
@@ -180,18 +162,18 @@ func readCmd(c *cmd, txn *client.Txn, t *testing.T) error {
 }
 
 // deleteCmd deletes the value at the given key from the db.
-func deleteCmd(c *cmd, txn *client.Txn, t *testing.T) error {
-	return txn.Del(c.getKey())
+func deleteCmd(ctx context.Context, c *cmd, txn *client.Txn) error {
+	return txn.Del(ctx, c.getKey())
 }
 
 // deleteRngCmd deletes the range of values from the db from [key, endKey).
-func deleteRngCmd(c *cmd, txn *client.Txn, t *testing.T) error {
-	return txn.DelRange(c.getKey(), c.getEndKey())
+func deleteRngCmd(ctx context.Context, c *cmd, txn *client.Txn) error {
+	return txn.DelRange(ctx, c.getKey(), c.getEndKey())
 }
 
 // scanCmd reads the values from the db from [key, endKey).
-func scanCmd(c *cmd, txn *client.Txn, t *testing.T) error {
-	rows, err := txn.Scan(c.getKey(), c.getEndKey(), 0)
+func scanCmd(ctx context.Context, c *cmd, txn *client.Txn) error {
+	rows, err := txn.Scan(ctx, c.getKey(), c.getEndKey(), 0)
 	if err != nil {
 		return err
 	}
@@ -209,13 +191,13 @@ func scanCmd(c *cmd, txn *client.Txn, t *testing.T) error {
 // incCmd adds one to the value of c.key in the env (as determined by
 // a previous read or write, or else assumed to be zero) and writes it
 // to the db.
-func incCmd(c *cmd, txn *client.Txn, t *testing.T) error {
+func incCmd(ctx context.Context, c *cmd, txn *client.Txn) error {
 	val, ok := c.env[c.key]
 	if !ok {
 		panic(fmt.Sprintf("can't increment key %q; not yet read", c.key))
 	}
 	r := val + 1
-	if err := txn.Put(c.getKey(), r); err != nil {
+	if err := txn.Put(ctx, c.getKey(), r); err != nil {
 		return err
 	}
 	c.env[c.key] = r
@@ -227,7 +209,7 @@ func incCmd(c *cmd, txn *client.Txn, t *testing.T) error {
 // and writes the value to the db. "c.endKey" here needs to be parsed
 // in the context of this command, which is a "+"-separated list of
 // keys from the env or numeric constants to sum.
-func writeCmd(c *cmd, txn *client.Txn, t *testing.T) error {
+func writeCmd(ctx context.Context, c *cmd, txn *client.Txn) error {
 	sum := int64(0)
 	for _, sp := range strings.Split(c.endKey, "+") {
 		if constant, err := strconv.Atoi(sp); err != nil {
@@ -236,18 +218,18 @@ func writeCmd(c *cmd, txn *client.Txn, t *testing.T) error {
 			sum += int64(constant)
 		}
 	}
-	err := txn.Put(c.getKey(), sum)
+	err := txn.Put(ctx, c.getKey(), sum)
 	c.debug = fmt.Sprintf("[%d]", sum)
 	return err
 }
 
 // commitCmd commits the transaction.
-func commitCmd(c *cmd, txn *client.Txn, t *testing.T) error {
-	return txn.Commit()
+func commitCmd(ctx context.Context, c *cmd, txn *client.Txn) error {
+	return txn.Commit(ctx)
 }
 
 type cmdSpec struct {
-	fn func(c *cmd, txn *client.Txn, t *testing.T) error
+	fn func(ctx context.Context, c *cmd, txn *client.Txn) error
 	re *regexp.Regexp
 }
 
@@ -391,36 +373,40 @@ func TestEnumerateIsolations(t *testing.T) {
 	}
 }
 
-// enumeratePriorities returns a slice enumerating all combinations of the
-// specified slice of priorities.
-func enumeratePriorities(priorities []int32) [][]int32 {
-	var results [][]int32
-	for i := 0; i < len(priorities); i++ {
-		leftover := enumeratePriorities(append(append([]int32(nil), priorities[:i]...), priorities[i+1:]...))
-		if len(leftover) == 0 {
-			results = [][]int32{{priorities[i]}}
+// enumeratePriorities returns a slice enumerating all combinations of
+// priorities across the transactions. The inner slice describes the
+// priority for each transaction. The outer slice contains each possible
+// combination of such transaction priorities.
+func enumeratePriorities(numTxns int, priorities []int32) [][]int32 {
+	n := len(priorities)
+	result := [][]int32{}
+	for i := 0; i < int(math.Pow(float64(n), float64(numTxns))); i++ {
+		desc := make([]int32, numTxns)
+		val := i
+		for j := 0; j < numTxns; j++ {
+			desc[j] = priorities[val%n]
+			val /= n
 		}
-		for j := 0; j < len(leftover); j++ {
-			results = append(results, append([]int32{priorities[i]}, leftover[j]...))
-		}
+		result = append(result, desc)
 	}
-	return results
+	return result
 }
 
 func TestEnumeratePriorities(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	p1 := int32(1)
 	p2 := int32(2)
-	p3 := int32(3)
 	expPriorities := [][]int32{
-		{p1, p2, p3},
-		{p1, p3, p2},
-		{p2, p1, p3},
-		{p2, p3, p1},
-		{p3, p1, p2},
-		{p3, p2, p1},
+		{p1, p1, p1},
+		{p2, p1, p1},
+		{p1, p2, p1},
+		{p2, p2, p1},
+		{p1, p1, p2},
+		{p2, p1, p2},
+		{p1, p2, p2},
+		{p2, p2, p2},
 	}
-	enum := enumeratePriorities([]int32{p1, p2, p3})
+	enum := enumeratePriorities(3, []int32{p1, p2})
 	if !reflect.DeepEqual(enum, expPriorities) {
 		t.Errorf("expected enumeration to match %v; got %v", expPriorities, enum)
 	}
@@ -656,11 +642,7 @@ func newHistoryVerifier(
 
 func (hv *historyVerifier) run(isolations []enginepb.IsolationType, db *client.DB, t *testing.T) {
 	log.Infof(context.Background(), "verifying all possible histories for the %q anomaly", hv.name)
-	priorities := make([]int32, len(hv.txns))
-	for i := 0; i < len(hv.txns); i++ {
-		priorities[i] = int32(i + 1)
-	}
-	enumPri := enumeratePriorities(priorities)
+	enumPri := enumeratePriorities(len(hv.txns), []int32{1, roachpb.MaxTxnPriority})
 	enumIso := enumerateIsolations(len(hv.txns), isolations)
 	enumHis := enumerateHistories(hv.txns, hv.equal)
 
@@ -733,6 +715,7 @@ func (hv *historyVerifier) runHistory(
 		}
 	}
 	plannedStr := historyString(cmds)
+
 	if log.V(1) {
 		log.Infof(context.Background(), "iso=%d pri=%d history=%s", isolations, priorities, plannedStr)
 	}
@@ -811,7 +794,7 @@ func (hv *historyVerifier) runCmds(
 ) (string, map[string]int64, error) {
 	var strs []string
 	env := map[string]int64{}
-	err := db.Txn(context.TODO(), func(txn *client.Txn) error {
+	err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		for _, c := range cmds {
 			c.historyIdx = hv.idx
 			c.env = env
@@ -839,7 +822,15 @@ func (hv *historyVerifier) runTxn(
 	txnName := fmt.Sprintf("txn %d", txnIdx+1)
 	cmdIdx := -1
 
-	err := db.Txn(context.TODO(), func(txn *client.Txn) error {
+	// db.Txn will set the transaction's original timestamp, so if this txn's
+	// first command has a prev command, wait for it before calling db.Txn so
+	// that we're guaranteed to have a later timestamp.
+	if prev := cmds[0].prev; prev != nil {
+		err := <-prev.ch
+		prev.ch <- err
+	}
+
+	err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		// If this is 2nd attempt, and a retry wasn't expected, return a
 		// retry error which results in further histories being enumerated.
 		if retry++; retry > 1 {
@@ -852,7 +843,7 @@ func (hv *historyVerifier) runTxn(
 			cmds[cmdIdx].done(nil)
 		}
 
-		txn.SetDebugName(txnName, 0)
+		txn.SetDebugName(txnName)
 		if isolation == enginepb.SNAPSHOT {
 			if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 				return err
@@ -899,13 +890,10 @@ func checkConcurrency(
 	name string, isolations []enginepb.IsolationType, txns []string, verify *verifier, t *testing.T,
 ) {
 	verifier := newHistoryVerifier(name, txns, verify, t)
-	dbCtx := client.DefaultDBContext()
-	dbCtx.TxnRetryOptions = correctnessTestRetryOptions
 	s := &localtestcluster.LocalTestCluster{
-		DBContext:         &dbCtx,
-		RangeRetryOptions: &correctnessTestRetryOptions,
+		DontRetryPushTxnFailures: true,
 	}
-	s.Start(t, testutils.NewNodeTestBaseContext(), InitSenderForLocalTestCluster)
+	s.Start(t, testutils.NewNodeTestBaseContext(), InitFactoryForLocalTestCluster)
 	defer s.Stop()
 	verifier.run(isolations, s.DB, t)
 }
@@ -947,6 +935,11 @@ func checkConcurrency(
 //    R1(A) R2(B) I2(B) R2(A) I2(A) R1(B) C1 C2
 func TestTxnDBReadSkewAnomaly(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	if testing.Short() {
+		t.Skip("short flag")
+	}
+
 	txn1 := "R(A) R(B) W(C,A+B) C"
 	txn2 := "R(A) R(B) I(A) I(B) C"
 	verify := &verifier{

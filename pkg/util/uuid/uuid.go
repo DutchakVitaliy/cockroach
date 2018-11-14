@@ -11,14 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package uuid
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
+	"github.com/pkg/errors"
 	"github.com/satori/go.uuid"
 )
 
@@ -28,19 +30,32 @@ type UUID struct {
 	uuid.UUID
 }
 
+// Nil is the empty UUID with all 128 bits set to zero.
+var Nil = UUID{uuid.Nil}
+
 // Short returns the first eight characters of the output of String().
 func (u UUID) Short() string {
 	return u.String()[:8]
 }
+
+// ShortStringer implements fmt.Stringer to output Short() on String().
+type ShortStringer UUID
+
+// String is part of fmt.Stringer.
+func (s ShortStringer) String() string {
+	return UUID(s).Short()
+}
+
+var _ fmt.Stringer = ShortStringer{}
 
 // Bytes shadows (*github.com/satori/go.uuid.UUID).Bytes() to prevent UUID
 // from implementing github.com/golang/protobuf/proto.raw, the semantics of
 // which do not match the semantics of the shadowed method. See
 // https://github.com/golang/protobuf/blob/5386fff/proto/text.go#L173:L176.
 //
-//
-// TODO(tschottdorf): fix upstream.
-// TODO(tamird): what does fixing upstream even mean?
+// TODO(tamird): remove when fixed upstream. See
+// https://github.com/gogo/protobuf/pull/227 and
+// https://github.com/golang/protobuf/issues/311.
 func (UUID) Bytes() {
 	panic("intentionally shadowed; use GetBytes()")
 }
@@ -48,12 +63,25 @@ func (UUID) Bytes() {
 // Silence unused warning for UUID.Bytes.
 var _ = (UUID).Bytes
 
+// Equal returns true iff the receiver equals the argument.
+//
+// This method exists only to conform to the API expected by gogoproto's
+// generated Equal implementations.
+func (u UUID) Equal(t UUID) bool {
+	return u == t
+}
+
 // GetBytes returns the UUID as a byte slice.
 func (u UUID) GetBytes() []byte {
 	return u.UUID.Bytes()
 }
 
-// Size returns the marshalled size of u, in bytes.
+// ToUint128 returns the UUID as a Uint128.
+func (u UUID) ToUint128() uint128.Uint128 {
+	return uint128.FromBytes(u.GetBytes())
+}
+
+// Size returns the marshaled size of u, in bytes.
 func (u UUID) Size() int {
 	return len(u.UUID)
 }
@@ -66,6 +94,22 @@ func (u UUID) MarshalTo(data []byte) (int, error) {
 // Unmarshal unmarshals data to u.
 func (u *UUID) Unmarshal(data []byte) error {
 	return u.UUID.UnmarshalBinary(data)
+}
+
+// MarshalJSON returns the JSON encoding of u.
+func (u UUID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(u.String())
+}
+
+// UnmarshalJSON unmarshals the JSON encoded data into u.
+func (u *UUID) UnmarshalJSON(data []byte) error {
+	var uuidString string
+	if err := json.Unmarshal(data, &uuidString); err != nil {
+		return err
+	}
+	uuid, err := FromString(uuidString)
+	*u = uuid
+	return err
 }
 
 // MakeV4 delegates to "github.com/satori/go.uuid".NewV4 and wraps the result in
@@ -96,4 +140,14 @@ func FromBytes(input []byte) (UUID, error) {
 func FromString(input string) (UUID, error) {
 	u, err := uuid.FromString(input)
 	return UUID{u}, err
+}
+
+// FromUint128 delegates to "github.com/satori/go.uuid".FromBytes and wraps the
+// result in a UUID.
+func FromUint128(input uint128.Uint128) UUID {
+	u, err := uuid.FromBytes(input.GetBytes())
+	if err != nil {
+		panic(errors.Wrap(err, "should never happen with 16 byte slice"))
+	}
+	return UUID{u}
 }

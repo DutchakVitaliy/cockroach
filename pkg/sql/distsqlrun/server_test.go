@@ -11,20 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"testing"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -33,36 +33,43 @@ import (
 func TestServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	ctx := context.Background()
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
-	conn, err := s.RPCContext().GRPCDial(s.ServingAddr())
+	defer s.Stopper().Stop(ctx)
+	conn, err := s.RPCContext().GRPCDial(s.ServingAddr()).Connect(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	r := sqlutils.MakeSQLRunner(t, sqlDB)
+	r := sqlutils.MakeSQLRunner(sqlDB)
 
-	r.Exec(`CREATE DATABASE test`)
-	r.Exec(`CREATE TABLE test.t (a INT PRIMARY KEY, b INT)`)
-	r.Exec(`INSERT INTO test.t VALUES (1, 10), (2, 20), (3, 30)`)
+	r.Exec(t, `CREATE DATABASE test`)
+	r.Exec(t, `CREATE TABLE test.t (a INT PRIMARY KEY, b INT)`)
+	r.Exec(t, `INSERT INTO test.t VALUES (1, 10), (2, 20), (3, 30)`)
 
 	td := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 
 	ts := TableReaderSpec{
-		Table:         *td,
-		IndexIdx:      0,
-		Reverse:       false,
-		Spans:         nil,
+		Table:    *td,
+		IndexIdx: 0,
+		Reverse:  false,
+		Spans:    []TableReaderSpan{{Span: td.PrimaryIndexSpan()}},
+	}
+	post := PostProcessSpec{
 		Filter:        Expression{Expr: "@1 != 2"}, // a != 2
-		OutputColumns: []uint32{0, 1},              // a
+		Projection:    true,
+		OutputColumns: []uint32{0, 1}, // a
 	}
 
-	txn := client.NewTxn(context.Background(), *kvDB)
+	txn := client.NewTxn(ctx, kvDB, s.NodeID(), client.RootTxn)
+	txnCoordMeta := txn.GetTxnCoordMeta(ctx)
+	txnCoordMeta.StripRootToLeaf()
 
-	req := &SetupFlowRequest{Txn: txn.Proto}
+	req := &SetupFlowRequest{Version: Version, TxnCoordMeta: &txnCoordMeta}
 	req.Flow = FlowSpec{
 		Processors: []ProcessorSpec{{
 			Core: ProcessorCoreUnion{TableReader: &ts},
+			Post: post,
 			Output: []OutputRouterSpec{{
 				Type:    OutputRouterSpec_PASS_THROUGH,
 				Streams: []StreamEndpointSpec{{Type: StreamEndpointSpec_SYNC_RESPONSE}},
@@ -71,12 +78,17 @@ func TestServer(t *testing.T) {
 	}
 
 	distSQLClient := NewDistSQLClient(conn)
-	stream, err := distSQLClient.RunSyncFlow(context.Background(), req)
+	stream, err := distSQLClient.RunSyncFlow(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := stream.Send(&ConsumerSignal{SetupFlowRequest: req}); err != nil {
+		t.Fatal(err)
+	}
+
 	var decoder StreamDecoder
 	var rows sqlbase.EncDatumRows
+	var metas []ProducerMetadata
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
@@ -89,16 +101,75 @@ func TestServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rows = testGetDecodedRows(t, &decoder, rows)
+		rows, metas = testGetDecodedRows(t, &decoder, rows, metas)
 	}
-	if done, trailerErr := decoder.IsDone(); !done {
-		t.Fatal("stream not done")
-	} else if trailerErr != nil {
-		t.Fatal("error in the stream trailer:", trailerErr)
+	metas = ignoreTxnCoordMeta(metas)
+	if len(metas) != 0 {
+		t.Errorf("unexpected metadata: %v", metas)
 	}
-	str := rows.String()
+	str := rows.String(twoIntCols)
 	expected := "[[1 10] [3 30]]"
 	if str != expected {
 		t.Errorf("invalid results: %s, expected %s'", str, expected)
+	}
+
+	// Verify version handling.
+	t.Run("version", func(t *testing.T) {
+		testCases := []struct {
+			version     DistSQLVersion
+			expectedErr string
+		}{
+			{
+				version:     Version + 1,
+				expectedErr: "version mismatch",
+			},
+			{
+				version:     MinAcceptedVersion - 1,
+				expectedErr: "version mismatch",
+			},
+			{
+				version:     MinAcceptedVersion,
+				expectedErr: "",
+			},
+		}
+		for _, tc := range testCases {
+			t.Run(fmt.Sprintf("%d", tc.version), func(t *testing.T) {
+				distSQLClient := NewDistSQLClient(conn)
+				stream, err := distSQLClient.RunSyncFlow(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Version = tc.version
+				if err := stream.Send(&ConsumerSignal{SetupFlowRequest: req}); err != nil {
+					t.Fatal(err)
+				}
+				_, err = stream.Recv()
+				if !testutils.IsError(err, tc.expectedErr) {
+					t.Errorf("expected error '%s', got %v", tc.expectedErr, err)
+				}
+				// In the expectedErr == nil case, we leave a flow hanging; we're not
+				// consuming it. It will get canceled by the draining process.
+			})
+		}
+	})
+}
+
+// Test that a node gossips its DistSQL version information.
+func TestDistSQLServerGossipsVersion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	var v DistSQLVersionGossipInfo
+	if err := s.Gossip().GetInfoProto(
+		gossip.MakeDistSQLNodeVersionKey(s.NodeID()), &v,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if v.Version != Version || v.MinAcceptedVersion != MinAcceptedVersion {
+		t.Fatalf("node is gossipping the wrong version. Expected: [%d-%d], got [%d-%d",
+			Version, MinAcceptedVersion, v.Version, v.MinAcceptedVersion)
 	}
 }

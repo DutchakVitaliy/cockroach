@@ -11,25 +11,22 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package storage_test
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -42,19 +39,28 @@ func TestGossipFirstRange(t *testing.T) {
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 		})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
-	errors := make(chan error)
+	errors := make(chan error, 1)
 	descs := make(chan *roachpb.RangeDescriptor)
 	unregister := tc.Servers[0].Gossip().RegisterCallback(gossip.KeyFirstRangeDescriptor,
 		func(_ string, content roachpb.Value) {
 			var desc roachpb.RangeDescriptor
 			if err := content.GetProto(&desc); err != nil {
-				errors <- err
+				select {
+				case errors <- err:
+				default:
+				}
 			} else {
-				descs <- &desc
+				select {
+				case descs <- &desc:
+				case <-time.After(45 * time.Second):
+					t.Logf("had to drop descriptor %+v", desc)
+				}
 			}
 		},
+		// Redundant callbacks are required by this test.
+		gossip.Redundant,
 	)
 	// Unregister the callback before attempting to stop the stopper to prevent
 	// deadlock. This is still flaky in theory since a callback can fire between
@@ -143,20 +149,30 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 	// the replaced node's leases to time out, but has still shown itself to be
 	// long enough to avoid flakes.
 	serverArgs := base.TestServerArgs{
-		RaftTickInterval:         50 * time.Millisecond,
-		RaftElectionTimeoutTicks: 10,
+		Addr:     util.IsolatedTestAddr.String(),
+		Insecure: true, // because our certs are only valid for 127.0.0.1
 		RetryOptions: retry.Options{
 			InitialBackoff: 10 * time.Millisecond,
 			MaxBackoff:     50 * time.Millisecond,
 		},
 	}
+	serverArgs.RaftTickInterval = 50 * time.Millisecond
+	serverArgs.RaftElectionTimeoutTicks = 10
 
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationAuto,
+			// Use manual replication so that we can ensure the range is properly
+			// replicated to all three nodes before stopping one of them.
+			ReplicationMode: base.ReplicationManual,
 			ServerArgs:      serverArgs,
 		})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
+
+	// Ensure that the first range is fully replicated before moving on.
+	firstRangeKey := keys.MinKey
+	if _, err := tc.AddReplicas(firstRangeKey, tc.Target(1), tc.Target(2)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Take down a node other than the first node and replace it with a new one.
 	// Replacing the first node would be better from an adversarial testing
@@ -167,8 +183,10 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 	newServerArgs.Addr = tc.Servers[oldNodeIdx].ServingAddr()
 	newServerArgs.PartOfCluster = true
 	newServerArgs.JoinAddr = tc.Servers[1].ServingAddr()
+	log.Infof(ctx, "stopping server %d", oldNodeIdx)
 	tc.StopServer(oldNodeIdx)
 	tc.AddServer(t, newServerArgs)
+
 	tc.WaitForStores(t, tc.Server(1).Gossip())
 
 	// Ensure that all servers still running are responsive. If the two remaining
@@ -178,7 +196,7 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 		if i == oldNodeIdx {
 			continue
 		}
-		kvClient := server.KVClient().(*client.DB)
+		kvClient := server.DB()
 		if err := kvClient.Put(ctx, fmt.Sprintf("%d", i), i); err != nil {
 			t.Errorf("failed Put to node %d: %s", i, err)
 		}
